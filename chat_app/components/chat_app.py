@@ -35,9 +35,9 @@ class ChatApp(QtWidgets.QWidget):
         )
 
         if messageType == "sent":
-            style += "margin: 5px 10px 5px auto; font-size: 14px;"
+            style += "margin: 5px 10px 5px auto; font-size: 14px; color: black;"
         else:
-            style += f"background-color: {self.COLORS['golden_bay']}; margin: 5px auto 5px 10px; font-size: 14px;"
+            style += f"background-color: {self.COLORS['golden_bay']}; margin: 5px auto 5px 10px; font-size: 14px; color: black;"
 
         messageContainer.setStyleSheet(style)
         messageContainer.setWordWrap(True)

@@ -30,6 +30,7 @@ class InputArea(QtWidgets.QWidget):
             background-color: {self.colors['white']}; 
             font-size: 14px;
             font-family: Arial, sans-serif;
+            color: black; 
         """)
         self.messageInput.setFixedHeight(50)  # Set initial height to 50
 
