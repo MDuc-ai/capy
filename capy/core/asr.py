@@ -1,256 +1,229 @@
-from collections import deque
-from threading import Thread, Event
-from queue import Queue
-import audioop
+from __future__ import annotations
 
-import pyaudio as pa
+import asyncio
+import math
+from typing import Callable, List, Optional
+
+import msgpack
 import numpy as np
+import websockets
+from loguru import logger
 
-from faster_whisper import WhisperModel
+from capy.utils.worker import AsyncWorker
 
 
-class CapyASR:
+# The Kyutai STT rust server expects mono float32 PCM at 24kHz.
+SAMPLE_RATE = 24000
+ASR_STREAMING_PATH = "/api/asr-streaming"
+
+# Kyutai STT processes audio in fixed-size frames. Unmute sends 1920 samples (80 ms) per frame.
+SAMPLES_PER_FRAME = 1920
+FRAME_TIME_SEC = SAMPLES_PER_FRAME / SAMPLE_RATE
+
+# Algorithmic delay of the STT model (0.5 s for stt-1b, 2.5 s for stt-2.6b). When the VAD
+# predicts end-of-turn, words still in this buffer have not been emitted yet; the flush trick
+# (sending silence frames) pushes them through before we publish the segment.
+STT_DELAY_SEC = 0.5
+
+# The semantic VAD Step message exposes pause-prediction scores in ``prs``. Unmute uses index 2.
+PAUSE_PREDICTION_HEAD_INDEX = 2
+PAUSE_THRESHOLD = 0.6
+
+# Pause scores are noisy for the first few Step messages after connect.
+N_STEPS_TO_IGNORE = 12
+
+
+class ExponentialMovingAverage:
+    """Smooth pause-prediction scores to avoid false end-of-turn on brief gaps."""
+
+    def __init__(
+        self,
+        attack_time: float = 0.01,
+        release_time: float = 0.01,
+        initial_value: float = 1.0,
+    ):
+        self.value = initial_value
+        self.attack_time = attack_time
+        self.release_time = release_time
+
+    def update(self, dt: float, new_value: float) -> None:
+        if new_value > self.value:
+            alpha = 1 - math.exp(-dt / self.attack_time)
+        else:
+            alpha = 1 - math.exp(-dt / self.release_time)
+        self.value = alpha * new_value + (1 - alpha) * self.value
+
+
+class CapyASR(AsyncWorker):
     """
-    Capy's Automatic Speech Recognition (ASR) engine, transcribe audio from microphone in real-time.
+    Capy's Automatic Speech Recognition (ASR) engine, backed by the Kyutai STT rust server.
 
-    The implementation is inspired by the speech_recognition library.
-    https://github.com/Uberi/speech_recognition
+    This is an :class:`AsyncWorker`: raw audio chunks are fed in through
+    ``consume_nonblocking`` (e.g. by a microphone producer) and completed transcript segments
+    are published onto ``output_queue``.
 
-    Features:
-    - Record audio from microphone in real-time
-    - Transcribe audio from microphone in real-time
-    - TODO: Detect hot word to start the recording
-    - Prevent silence at the begining, avoid redundunt transcribing computations
-    - Auto stop recording if the silence is detected after a certain amount of time
+    Audio is streamed to the rust server over a WebSocket and transcribed there. The model
+    ships its own semantic VAD, so segmentation is delegated to the server: words are received
+    incrementally and a segment is emitted after the VAD predicts an end-of-turn pause and the
+    model delay buffer has been flushed (see Kyutai's "flush trick").
+
+    Protocol (msgpack over WebSocket, see the Kyutai delayed-streams-modeling samples):
+    - Send: ``{"type": "Audio", "pcm": [float, ...]}`` with mono float32 samples in [-1, 1].
+    - Receive: ``{"type": "Word", "text": str}`` and ``{"type": "Step", "prs": [float, ...]}``.
+
+    Expected input: mono float32 PCM chunks (``np.ndarray``) sampled at ``SAMPLE_RATE``.
     """
 
-    def __init__(self, sample_rate=16000,
-                 frames_per_buffer=1024,
-                 energy_threshold=300,
-                 end_silence_duration=0.8,
-                 non_speak_duration=0.5
-                 ):
+    def __init__(
+        self,
+        url: str = "ws://127.0.0.1:8080",
+        api_key: str = "public_token",
+        pause_prediction_head_index: int = PAUSE_PREDICTION_HEAD_INDEX,
+        pause_threshold: float = PAUSE_THRESHOLD,
+        delay_sec: float = STT_DELAY_SEC,
+    ):
         """
-        Initialize the ASR engine with the given parameters.
+        Initialize the ASR engine.
 
         Args:
-            sample_rate (int): Sample rate of the audio, the higher the better, but more computationally expensive.
-            frames_per_buffer (int): The number of frames to read at once.
-            energy_threshold (int): The minimum energy of the audio signal to be considered as a speech.
-            end_silence_duration (float): The duration of silence to detect the end of a phrase.
-            non_speak_duration (float): The duration of non-speech to include on both sides of the phrase.
+            url (str): Base URL of the Kyutai STT rust server.
+            api_key (str): API key sent via the ``kyutai-api-key`` header.
+            pause_prediction_head_index (int): Index into the Step message ``prs`` array for
+                pause prediction (Unmute uses 2).
+            pause_threshold (float): Smoothed pause score above which end-of-turn is detected.
+            delay_sec (float): STT model algorithmic delay; used by the flush trick after VAD.
         """
-        self.audio = pa.PyAudio()
-        self.audio_format = pa.paInt16  # For effeciency
-        try:
-            # Check the stream then close it
-            self.stream = self.audio.open(
-                format=self.audio_format,
-                channels=1,
-                rate=sample_rate,
-                input=True,
-                frames_per_buffer=frames_per_buffer,
-            )
-            self.stream.stop_stream()
-        except Exception as e:
-            self.audio.terminate()
-            raise e
+        super().__init__()
 
-        assert non_speak_duration < end_silence_duration, "non_speak_duration must be less than end_silence_duration"
+        self.ws_url = url.rstrip("/") + ASR_STREAMING_PATH
+        self.api_key = api_key
+        self.pause_prediction_head_index = pause_prediction_head_index
+        self.pause_threshold = pause_threshold
+        self.delay_sec = delay_sec
 
-        self.energy_threshold = energy_threshold
-        self.end_silence_duration = end_silence_duration
-        self.frames_per_buffer = frames_per_buffer
-        self.sample_rate = sample_rate
-        self.non_speak_duration = non_speak_duration
+        # Completed transcript segments are published here for downstream consumers.
+        self.output_queue: asyncio.Queue[str] = asyncio.Queue()
 
-        # For recording
-        self.finish_record_event = Event()
-        self.audio_queue = Queue()
-        self.listener_thread = None
+        # Words accumulated for the current (in-progress) segment.
+        self._words: List[str] = []
+        # Whether speech has been seen since the last emitted segment.
+        self._speech_started = False
+        self._cli_transcription_consumer: Optional[Callable[[str], None]] = None
 
-        # For transcribing
-        self.device = "cpu"
-        self.compute_type = "int8"
-        self.model = WhisperModel(
-            model_size_or_path="tiny.en",
-            device=self.device,
-            compute_type=self.compute_type,
-            num_workers=12,
-            cpu_threads=8,
-            local_files_only=True,
-        )
+        # Tracks model time via Step messages; starts negative by one model delay.
+        self._current_time = -self.delay_sec
+        self._pause_prediction = ExponentialMovingAverage()
+        self._steps_to_ignore = N_STEPS_TO_IGNORE
+        self._flushing = False
+        self._flush_end_time: Optional[float] = None
+        self._flush_queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
 
-    def __del__(self):
-        self.audio.terminate()
+    def set_cli_output(self, cli_output: object | None) -> None:
+        """Attach a CLI output worker to receive completed transcript segments."""
+        if cli_output is None:
+            self._cli_transcription_consumer = None
+            return
+        self._cli_transcription_consumer = cli_output.consume_transcription
 
-    def calibrate_energy_threshold(self, dynamic_energy_adjustment_damping=0.15, dynamic_energy_ratio=1.1, duration=1):
-        """
-        Adjusts the energy threshold dynamically with the ambient energy level using asymmetric weighted average.
-        NOTE: This method should be called only on periods of audio without speech for accurate result. 
-        """
-        seconds_per_buffer = self.frames_per_buffer / self.sample_rate
-        elapsed_time = 0
-        
-        if self.stream.is_stopped():
-            self.stream.start_stream()
+    def _publish_transcript(self, transcript: str) -> None:
+        self.output_queue.put_nowait(transcript)
+        if self._cli_transcription_consumer is not None:
+            self._cli_transcription_consumer(transcript)
+
+    def _start_flush(self) -> None:
+        """Push silence through the STT delay buffer so trailing words are emitted."""
+        self._flushing = True
+        self._flush_end_time = self._current_time + self.delay_sec
+        num_frames = int(math.ceil(self.delay_sec / FRAME_TIME_SEC)) + 1
+        zero_frame = np.zeros(SAMPLES_PER_FRAME, dtype=np.float32)
+        for _ in range(num_frames):
+            self._flush_queue.put_nowait(zero_frame)
+
+    def _finish_segment(self) -> None:
+        """Publish the accumulated segment and reset turn state."""
+        transcript = " ".join(self._words)
+        if transcript.strip():
+            self._publish_transcript(transcript)
+        self._words = []
+        self._speech_started = False
+        self._flushing = False
+        self._flush_end_time = None
+
+    async def _send_audio(self, websocket):
+        """Drain audio chunks from the input queue and stream them to the server."""
+        # Drop any audio buffered before the connection was ready to avoid lag.
+        while not self.input_queue.empty():
+            self.input_queue.get_nowait()
 
         while True:
-            elapsed_time += seconds_per_buffer
-            if elapsed_time > duration:
-                break
-            buffer = self.stream.read(self.frames_per_buffer)
-            energy = audioop.rms(buffer, pa.get_sample_size(self.audio_format))
-
-            # dynamically adjust the energy threshold using asymmetric weighted average
-            # account for different chunk sizes and rates
-            damping = dynamic_energy_adjustment_damping ** seconds_per_buffer
-            target_energy = energy * dynamic_energy_ratio
-            self.energy_threshold = self.energy_threshold * \
-                damping + target_energy * (1 - damping)
-
-        return self.energy_threshold
-
-    def listen(self, timeout=5):
-        """
-        Record and detect a phrase from the microphone.
-        A phrase is a continuous segment of audio.
-        It starts when the audio's energy is above the `energy_threshold` 
-        and end when `timeout` seconds have passed or 
-        the detected silence lasts for `end_silence_duration` seconds.
-        A phrase can be also bounded by silence segments if the silence segments exists.
-
-        Args:
-            timeout (int, optional): The maximum number of seconds for a phrase. Defaults to 5.
-        Returns:
-            bytes: The recorded audio in bytes, in int16 format.
-        """
-        seconds_per_buffer = self.frames_per_buffer / self.sample_rate
-        # The number of non-speak frames bound around a phrase
-        n_non_speak_frames = int(self.non_speak_duration / seconds_per_buffer)
-
-        elapsed_time = 0
-        buffer = b""  # End of the recording is when buffer empty
-        frames = deque()
-
-        if self.stream.is_stopped():
-            self.stream.start_stream()
-        
-        # Wait until detecting the start of the phrase
-        while True:
-            buffer = self.stream.read(self.frames_per_buffer)
-            if len(buffer) == 0:
-                break
-
-            # Raise error if waiting too long
-            elapsed_time += seconds_per_buffer
-            if elapsed_time > timeout:
-                raise TimeoutError(
-                    f"No speech detected in {timeout} seconds.")
-
-            # Only keep `non_speak_duration` seconds of non-speak audio at the begining of a phrase
-            frames.append(buffer)
-            if len(frames) > n_non_speak_frames:
-                frames.popleft()
-
-            energy = audioop.rms(
-                buffer, pa.get_sample_size(self.audio_format))
-            if energy > self.energy_threshold:
-                # Start of phrase detected
-                break
-
-        # Recording
-        pause_secs = 0  # Number of seconds of silence detected after the start
-        n_end_silence_frames = 0  # Number of silence frames detected by the end of the phrase
-        start_time = elapsed_time
-        while True:
-            elapsed_time += seconds_per_buffer
-
-            if elapsed_time - start_time >= timeout:
-                break
-
-            buffer = self.stream.read(self.frames_per_buffer)
-            if len(buffer) == 0:
-                break
-            frames.append(buffer)
-
-            energy = audioop.rms(
-                buffer, pa.get_sample_size(self.audio_format))
-            if energy < self.energy_threshold:
-                # Silence detected
-                pause_secs += seconds_per_buffer
-                n_end_silence_frames += 1
+            if not self._flush_queue.empty():
+                pcm = self._flush_queue.get_nowait()
             else:
-                pause_secs = n_end_silence_frames = 0
-            if pause_secs >= self.end_silence_duration:
-                # End of phrase detected
-                break
+                chunk = await self.input_queue.get()
+                pcm = np.asarray(chunk, dtype=np.float32).reshape(-1)
 
-        # Remove last silence frames
-        for _ in range(n_end_silence_frames - n_non_speak_frames):
-            frames.pop()
-
-        return b"".join(frames)
-
-    def listen_in_background(self, timeout=5):
-        """
-        Record and detect a phrase from the microphone in a background thread.
-
-        Args:
-            timeout (int, optional): The maximum number of seconds for a phrase. Defaults to 5.
-        """
-
-        def threaded_listen():
-            while not self.finish_record_event.is_set():
-                try:
-                    audio = self.listen(timeout=timeout)
-                except TimeoutError:
-                    pass
-                else:
-                    if not self.finish_record_event.is_set():
-                        self.audio_queue.put(audio)
-
-        self.listener_thread = Thread(target=threaded_listen)
-        self.listener_thread.daemon = True
-        self.listener_thread.start()
-
-    def _transcribe(self, audio):
-        """
-        Transcribe the audio in the given np.ndarray of float32.
-
-        Args:
-            audio (bytes): The audio array.
-        Returns:
-            str: The transcribed text.
-        """
-        segments, _ = self.model.transcribe(
-                audio,
-                beam_size=3,
-                language="en",
-                vad_filter=True,
-                without_timestamps=True,
-                condition_on_previous_text=True,
+            msg = msgpack.packb(
+                {"type": "Audio", "pcm": pcm.tolist()},
+                use_bin_type=True,
+                use_single_float=True,
             )
-        return "".join([segment.text for segment in segments])
+            await websocket.send(msg)
 
-    def transcribe(self):
+    def _handle_message(self, data: dict):
+        """Update transcript state from a single decoded server message."""
+        msg_type = data.get("type")
+        if msg_type == "Word":
+            # First word of a new turn: interrupt the rest of the pipeline so the assistant
+            # stops talking as soon as the user starts speaking (before end-of-turn).
+            if not self._speech_started:
+                self.broadcast_interrupt()
+            self._words.append(data["text"])
+            self._speech_started = True
+        elif msg_type == "Step":
+            self._current_time += FRAME_TIME_SEC
+            if self._steps_to_ignore > 0:
+                self._steps_to_ignore -= 1
+            else:
+                pause_prediction = data["prs"][self.pause_prediction_head_index]
+                self._pause_prediction.update(FRAME_TIME_SEC, pause_prediction)
+
+            if (
+                not self._flushing
+                and self._speech_started
+                and self._pause_prediction.value > self.pause_threshold
+            ):
+                # End-of-turn detected: flush the delay buffer before emitting the segment.
+                self._start_flush()
+            elif (
+                self._flushing
+                and self._flush_end_time is not None
+                and self._current_time > self._flush_end_time
+                and self._flush_queue.empty()
+            ):
+                self._finish_segment()
+        elif msg_type == "Error":
+            logger.error("Kyutai STT server error: {}", data.get("message"))
+
+    async def _receive_transcripts(self, websocket):
+        """Receive server messages, accumulate words, and emit VAD-segmented transcripts."""
+        async for message in websocket:
+            self._handle_message(msgpack.unpackb(message, raw=False))
+
+    async def _run_loop(self):
         """
-        Transcribe the audio from microphone. Transcript chunks will be yielded.
+        Connect to the Kyutai STT rust server and run the send/receive streaming loop until
+        the worker task is cancelled.
         """
-        if not self.audio_queue.empty():
-            audio = b"".join(self.audio_queue.queue)
-            self.audio_queue.queue.clear()
-            # Convert 16-bit int to 32-bit float and clamp to [-1.0, 1.0]
-            float32_audio = np.frombuffer(
-                audio, dtype=np.int16).astype(np.float32) / 32768.0
-            transcript = self._transcribe(float32_audio)
-            return transcript
-        # Empty string when no audio yet
-        return ""
-    
-    def stop_transcribing(self):
-        self.finish_record_event.set()
-        self.listener_thread.join()
-        self.listener_thread = None
-        self.finish_record_event.clear()
-        self.stream.stop_stream()
+        headers = {"kyutai-api-key": self.api_key}
+        async with websockets.connect(self.ws_url, additional_headers=headers) as websocket:
+            send_task = asyncio.create_task(self._send_audio(websocket))
+            receive_task = asyncio.create_task(self._receive_transcripts(websocket))
+            try:
+                await asyncio.gather(send_task, receive_task)
+            finally:
+                send_task.cancel()
+                receive_task.cancel()
+
+    async def get_transcript(self) -> str:
+        """Await the next completed transcript segment."""
+        return await self.output_queue.get()
