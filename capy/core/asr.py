@@ -21,9 +21,10 @@ SAMPLES_PER_FRAME = 1920
 FRAME_TIME_SEC = SAMPLES_PER_FRAME / SAMPLE_RATE
 
 # Algorithmic delay of the STT model (0.5 s for stt-1b, 2.5 s for stt-2.6b). When the VAD
-# predicts end-of-turn, words still in this buffer have not been emitted yet; the flush trick
-# (sending silence frames) pushes them through before we publish the segment.
+# predicts end-of-turn, words still in this buffer have not been emitted yet. The hybrid flush
+# keeps feeding real mic audio for FLUSH_GRACE_SEC, then pads silence to drain the rest.
 STT_DELAY_SEC = 0.5
+FLUSH_GRACE_SEC = 0.24
 
 # The semantic VAD Step message exposes pause-prediction scores in ``prs``. Unmute uses index 2.
 PAUSE_PREDICTION_HEAD_INDEX = 2
@@ -65,7 +66,8 @@ class CapyASR(AsyncWorker):
     Audio is streamed to the rust server over a WebSocket and transcribed there. The model
     ships its own semantic VAD, so segmentation is delegated to the server: words are received
     incrementally and a segment is emitted after the VAD predicts an end-of-turn pause and the
-    model delay buffer has been flushed (see Kyutai's "flush trick").
+    model delay buffer has been flushed: real mic audio is streamed for a short grace period,
+    then silence is padded to drain any remaining delay.
 
     Protocol (msgpack over WebSocket, see the Kyutai delayed-streams-modeling samples):
     - Send: ``{"type": "Audio", "pcm": [float, ...]}`` with mono float32 samples in [-1, 1].
@@ -81,6 +83,7 @@ class CapyASR(AsyncWorker):
         pause_prediction_head_index: int = PAUSE_PREDICTION_HEAD_INDEX,
         pause_threshold: float = PAUSE_THRESHOLD,
         delay_sec: float = STT_DELAY_SEC,
+        grace_sec: float = FLUSH_GRACE_SEC,
     ):
         """
         Initialize the ASR engine.
@@ -91,7 +94,8 @@ class CapyASR(AsyncWorker):
             pause_prediction_head_index (int): Index into the Step message ``prs`` array for
                 pause prediction (Unmute uses 2).
             pause_threshold (float): Smoothed pause score above which end-of-turn is detected.
-            delay_sec (float): STT model algorithmic delay; used by the flush trick after VAD.
+            delay_sec (float): STT model algorithmic delay; total flush window after VAD.
+            grace_sec (float): How long to keep feeding real mic audio before padding silence.
         """
         super().__init__()
 
@@ -100,6 +104,7 @@ class CapyASR(AsyncWorker):
         self.pause_prediction_head_index = pause_prediction_head_index
         self.pause_threshold = pause_threshold
         self.delay_sec = delay_sec
+        self.grace_sec = min(grace_sec, delay_sec)
 
         # Completed transcript segments are published here for downstream consumers.
         self.output_queue: asyncio.Queue[str] = asyncio.Queue()
@@ -116,6 +121,8 @@ class CapyASR(AsyncWorker):
         self._steps_to_ignore = N_STEPS_TO_IGNORE
         self._flushing = False
         self._flush_end_time: Optional[float] = None
+        self._grace_end_time: Optional[float] = None
+        self._silence_padding_started = False
         self._flush_queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
 
     def set_cli_output(self, cli_output: object | None) -> None:
@@ -131,10 +138,25 @@ class CapyASR(AsyncWorker):
             self._cli_transcription_consumer(transcript)
 
     def _start_flush(self) -> None:
-        """Push silence through the STT delay buffer so trailing words are emitted."""
+        """Begin hybrid flush: real mic audio first, then silence to drain the delay buffer."""
         self._flushing = True
         self._flush_end_time = self._current_time + self.delay_sec
-        num_frames = int(math.ceil(self.delay_sec / FRAME_TIME_SEC)) + 1
+        self._grace_end_time = self._current_time + self.grace_sec
+        self._silence_padding_started = False
+        while not self._flush_queue.empty():
+            self._flush_queue.get_nowait()
+
+    def _start_silence_padding(self) -> None:
+        """Pad silence for the remaining model delay after the grace period."""
+        if self._silence_padding_started or self._flush_end_time is None:
+            return
+
+        self._silence_padding_started = True
+        remaining = self._flush_end_time - self._current_time
+        if remaining <= 0:
+            return
+
+        num_frames = int(math.ceil(remaining / FRAME_TIME_SEC)) + 1
         zero_frame = np.zeros(SAMPLES_PER_FRAME, dtype=np.float32)
         for _ in range(num_frames):
             self._flush_queue.put_nowait(zero_frame)
@@ -148,6 +170,8 @@ class CapyASR(AsyncWorker):
         self._speech_started = False
         self._flushing = False
         self._flush_end_time = None
+        self._grace_end_time = None
+        self._silence_padding_started = False
 
     async def _send_audio(self, websocket):
         """Drain audio chunks from the input queue and stream them to the server."""
@@ -156,7 +180,7 @@ class CapyASR(AsyncWorker):
             self.input_queue.get_nowait()
 
         while True:
-            if not self._flush_queue.empty():
+            if self._silence_padding_started and not self._flush_queue.empty():
                 pcm = self._flush_queue.get_nowait()
             else:
                 chunk = await self.input_queue.get()
@@ -168,6 +192,34 @@ class CapyASR(AsyncWorker):
                 use_single_float=True,
             )
             await websocket.send(msg)
+
+    def _update_pause_prediction(self, pause_prediction: float) -> None:
+        if self._steps_to_ignore > 0:
+            self._steps_to_ignore -= 1
+            return
+        self._pause_prediction.update(FRAME_TIME_SEC, pause_prediction)
+
+    def _update_flush_state(self) -> None:
+        if not self._flushing:
+            if self._speech_started and self._pause_prediction.value > self.pause_threshold:
+                self._start_flush()
+            return
+
+        if (
+            not self._silence_padding_started
+            and self._grace_end_time is not None
+            and self._current_time >= self._grace_end_time
+        ):
+            self._start_silence_padding()
+
+        flush_complete = (
+            self._flush_end_time is not None
+            and self._current_time > self._flush_end_time
+            and self._silence_padding_started
+            and self._flush_queue.empty()
+        )
+        if flush_complete:
+            self._finish_segment()
 
     def _handle_message(self, data: dict):
         """Update transcript state from a single decoded server message."""
@@ -181,26 +233,8 @@ class CapyASR(AsyncWorker):
             self._speech_started = True
         elif msg_type == "Step":
             self._current_time += FRAME_TIME_SEC
-            if self._steps_to_ignore > 0:
-                self._steps_to_ignore -= 1
-            else:
-                pause_prediction = data["prs"][self.pause_prediction_head_index]
-                self._pause_prediction.update(FRAME_TIME_SEC, pause_prediction)
-
-            if (
-                not self._flushing
-                and self._speech_started
-                and self._pause_prediction.value > self.pause_threshold
-            ):
-                # End-of-turn detected: flush the delay buffer before emitting the segment.
-                self._start_flush()
-            elif (
-                self._flushing
-                and self._flush_end_time is not None
-                and self._current_time > self._flush_end_time
-                and self._flush_queue.empty()
-            ):
-                self._finish_segment()
+            self._update_pause_prediction(data["prs"][self.pause_prediction_head_index])
+            self._update_flush_state()
         elif msg_type == "Error":
             logger.error("Kyutai STT server error: {}", data.get("message"))
 
